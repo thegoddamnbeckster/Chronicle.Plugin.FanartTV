@@ -14,14 +14,21 @@ namespace Chronicle.Plugin.FanartTV;
 /// for the item by other providers (TMDB, TVDB, MusicBrainz).
 ///
 /// Resolution logic in <see cref="SearchAsync"/>:
-///   movies / fanedits  → uses TMDB movie ID from KnownExternalIds["tmdb"] (format: "movie:{id}")
-///   tv / anime         → uses TVDB ID from KnownExternalIds["tvdb"]       (format: "tv:{id}")
-///   music (artist)     → uses MusicBrainz artist MBID from KnownExternalIds["musicbrainz"]
+///   movies / fanedits  → KnownExternalIds["tmdb"] (format "movie:{id}")  → /v3.2/movies/{tmdbId}
+///   tv / anime         → KnownExternalIds["tvdb"] (raw TVDB numeric ID)  → /v3.2/tv/{tvdbId}
+///   music (level 0)    → KnownExternalIds["musicbrainz"] (artist MBID)   → /v3.2/music/{artistMbid}
+///   music (level 1+)   → parent's KnownExternalIds["musicbrainz"] (artist MBID), album MBID
+///                         used to select the correct album from the artist response
 ///
 /// External ID format stored by this plugin:
-///   "movie:{tmdbId}"   for movies and fan edits
-///   "tv:{tvdbId}"      for TV shows and anime
-///   "artist:{mbid}"    for music artists (album artwork retrieved in GetByIdAsync)
+///   "movie:{tmdbId}"        for movies and fan edits
+///   "tv:{tvdbId}"           for TV shows and anime  (TVDB IDs, NOT TMDB)
+///   "artist:{artistMbid}"   for music artists
+///   "album:{artistMbid}/{releaseGroupMbid}"  for music albums
+///
+/// TV items only receive artwork if a TVDB ID is available in media_external_ids
+/// (populated by Trakt/SIMKL sync). Items enriched only by TMDB will be NotFound
+/// until a TVDB ID is stored (via Trakt sync or manual Fix Match).
 ///
 /// If none of the required cross-reference IDs are available, SearchAsync returns empty
 /// and the enrichment service marks the row as NotFound for this provider.
@@ -178,10 +185,16 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
 
     // ── IMetadataProvider: search ─────────────────────────────────────────────
 
-    // External ID patterns this plugin produces
+    // External ID patterns this plugin produces / consumes
     private static readonly Regex _movieIdRe  = new(@"^movie:(\d+)$",     RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _tvIdRe     = new(@"^tv:(\d+)$",        RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _artistIdRe = new(@"^artist:([0-9a-f-]{36})$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _albumIdRe  = new(@"^album:([0-9a-f-]{36})/([0-9a-f-]{36})$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    // Fanart.tv URL patterns for Fix Match normalization
+    private static readonly Regex _fanartMovieUrlRe  = new(@"fanart\.tv/movie/(\d+)",   RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _fanartSeriesUrlRe = new(@"fanart\.tv/series/(\d+)",  RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _fanartMusicUrlRe  = new(@"fanart\.tv/music/([0-9a-f-]{36})", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     /// <summary>
     /// Fanart.tv has no text-search endpoint, so this method resolves by cross-referencing
@@ -212,14 +225,40 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
 
     /// <summary>
     /// Fetches artwork by a previously-stored Fanart.tv external ID.
-    /// Supports "movie:{id}", "tv:{id}", "artist:{mbid}" formats.
+    /// Supports "movie:{id}", "tv:{tvdbId}", "artist:{mbid}", "album:{artistMbid}/{rgMbid}" formats.
+    /// Also accepts Fanart.tv web URLs for Fix Match convenience:
+    ///   https://fanart.tv/movie/550/   → movie:550
+    ///   https://fanart.tv/series/76290/ → tv:76290
+    ///   https://fanart.tv/music/{mbid}/ → artist:{mbid}
     /// Returns an empty <see cref="MediaMetadata"/> when the ID is not found on Fanart.tv.
     /// </summary>
     public async Task<MediaMetadata> GetByIdAsync(string externalId, CancellationToken ct = default)
     {
         EnsureConfigured();
+        externalId = NormalizeFanartUrl(externalId);
         return await FetchByResolvedIdAsync(externalId, seasonNumber: null, ct)
                ?? new MediaMetadata { ExternalId = externalId };
+    }
+
+    /// <summary>
+    /// Converts a Fanart.tv web URL into the plugin's internal ID format.
+    /// Passes through anything that is already in internal format.
+    /// </summary>
+    private static string NormalizeFanartUrl(string input)
+    {
+        if (!input.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+            return input;
+
+        var movieMatch = _fanartMovieUrlRe.Match(input);
+        if (movieMatch.Success) return $"movie:{movieMatch.Groups[1].Value}";
+
+        var seriesMatch = _fanartSeriesUrlRe.Match(input);
+        if (seriesMatch.Success) return $"tv:{seriesMatch.Groups[1].Value}";
+
+        var musicMatch = _fanartMusicUrlRe.Match(input);
+        if (musicMatch.Success) return $"artist:{musicMatch.Groups[1].Value}";
+
+        return input; // unrecognised URL — pass through, will fail gracefully
     }
 
     /// <summary>
@@ -266,18 +305,50 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
         }
         else if (mediaType is "tv" or "anime")
         {
-            // TVDB stores a raw numeric ID
+            // TVDB stores a raw numeric ID. For seasons/episodes, the TVDB ID is on the
+            // parent show, not the child — check both the item's own ID and the parent's.
             if (known.TryGetValue("tvdb", out var tvdbId) && !string.IsNullOrWhiteSpace(tvdbId))
                 return $"tv:{tvdbId}";
+            if (known.TryGetValue("parent_tvdb", out var parentTvdbId) && !string.IsNullOrWhiteSpace(parentTvdbId))
+                return $"tv:{parentTvdbId}";
         }
         else if (mediaType is "music" or null)
         {
-            // MusicBrainz stores "artist:{mbid}", "release-group:{mbid}", etc.
-            if (known.TryGetValue("musicbrainz", out var mbId))
+            if (context.HierarchyLevel == 0)
             {
-                var mbid = ExtractMbid(mbId);
-                if (mbid is not null) return $"artist:{mbid}";
+                // Root level = artist. MusicBrainz stores "artist:{mbid}".
+                if (known.TryGetValue("musicbrainz", out var mbId))
+                {
+                    var mbid = ExtractMbid(mbId);
+                    if (mbid is not null) return $"artist:{mbid}";
+                }
             }
+            else if (context.HierarchyLevel == 1)
+            {
+                // Album level. We need:
+                //   - the artist's MBID (to call /v3.2/music/{artistMbid})
+                //   - the release-group MBID (to select the album in the response)
+                // The album item itself stores a release-group MBID. The parent artist
+                // stores the artist MBID. We use ParentExternalId convention: the enrichment
+                // service stores the parent's musicbrainz ID in KnownExternalIds under
+                // "parent_musicbrainz" when it populates the context.
+                // Fallback: if both artist and release-group MBIDs are in KnownExternalIds
+                // (e.g. populated from media_external_ids with multiple rows), use them.
+                known.TryGetValue("musicbrainz", out var albumMbId);
+                known.TryGetValue("parent_musicbrainz", out var artistMbId);
+
+                var albumMbid  = albumMbId  is not null ? ExtractMbid(albumMbId)  : null;
+                var artistMbid = artistMbId is not null ? ExtractMbid(artistMbId) : null;
+
+                if (artistMbid is not null && albumMbid is not null)
+                    return $"album:{artistMbid}/{albumMbid}";
+
+                // If we only have one MBID and it's an artist MBID (no release-group available),
+                // fall back to artist-level artwork.
+                if (artistMbid is not null)
+                    return $"artist:{artistMbid}";
+            }
+            // Tracks (level 2) have no useful Fanart.tv artwork — skip.
         }
 
         return null;
@@ -317,12 +388,19 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
         var movieMatch  = _movieIdRe.Match(resolvedId);
         var tvMatch     = _tvIdRe.Match(resolvedId);
         var artistMatch = _artistIdRe.Match(resolvedId);
+        var albumMatch  = _albumIdRe.Match(resolvedId);
 
         if (movieMatch.Success)
             return await FetchMovieAsync(movieMatch.Groups[1].Value, resolvedId, ct);
 
         if (tvMatch.Success)
             return await FetchTvAsync(tvMatch.Groups[1].Value, resolvedId, seasonNumber, ct);
+
+        if (albumMatch.Success)
+            return await FetchAlbumAsync(
+                albumMatch.Groups[1].Value,   // artistMbid
+                albumMatch.Groups[2].Value,   // releaseGroupMbid
+                resolvedId, ct);
 
         if (artistMatch.Success)
             return await FetchArtistAsync(artistMatch.Groups[1].Value, resolvedId, ct);
@@ -347,6 +425,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
         return new MediaMetadata
         {
             ExternalId    = externalId,
+            Source        = "fanarttv",
             Title         = response.Name ?? string.Empty,
             PosterUrl     = poster?.Url,
             BackdropUrl   = backdrop?.Url,
@@ -383,6 +462,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
         return new MediaMetadata
         {
             ExternalId      = externalId,
+            Source          = "fanarttv",
             Title           = response.Name ?? string.Empty,
             PosterUrl       = seasonPoster?.Url ?? poster?.Url,
             BackdropUrl     = backdrop?.Url,
@@ -439,6 +519,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
         return new MediaMetadata
         {
             ExternalId   = externalId,
+            Source       = "fanarttv",
             Title        = response.Name ?? string.Empty,
             PosterUrl    = thumb?.Url,
             BackdropUrl  = backdrop?.Url,
@@ -446,6 +527,36 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
             BannerUrl    = banner?.Url,
             ClearartUrl  = clearart?.Url,
             ExtendedData = extendedData,
+        };
+    }
+
+    /// <summary>
+    /// Fetches artwork for a specific album (release-group) from the artist endpoint.
+    /// The Fanart.tv API embeds per-album art inside the artist response keyed by release-group MBID,
+    /// so we always call the artist endpoint and extract the matching album entry.
+    /// </summary>
+    private async Task<MediaMetadata?> FetchAlbumAsync(
+        string artistMbid, string releaseGroupMbid, string externalId, CancellationToken ct)
+    {
+        var response = await _client!.GetArtistAsync(artistMbid, ct);
+        if (response is null) return null;
+
+        FanartAlbum? album = null;
+        response.Albums?.TryGetValue(releaseGroupMbid, out album);
+
+        var cover = BestImage(album?.AlbumCovers);
+        var cdart = BestImage(album?.CdArts);
+
+        // If this specific album has no art, still return a result so the row is marked
+        // Completed rather than left Pending indefinitely. Artwork may be added to Fanart.tv later
+        // and a resync will pick it up.
+        return new MediaMetadata
+        {
+            ExternalId = externalId,
+            Source     = "fanarttv",
+            Title      = string.Empty,    // title not available from album art response
+            PosterUrl  = cover?.Url,
+            DiscUrl    = cdart?.Url,
         };
     }
 
