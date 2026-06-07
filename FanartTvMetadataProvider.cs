@@ -1,7 +1,9 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Chronicle.Plugins;
 using Chronicle.Plugins.Models;
-using System.Text.RegularExpressions;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Chronicle.Plugin.FanartTV;
 
@@ -16,15 +18,16 @@ namespace Chronicle.Plugin.FanartTV;
 /// Resolution logic in <see cref="SearchAsync"/>:
 ///   movies / fanedits  → KnownExternalIds["tmdb"] (format "movie:{id}")  → /v3.2/movies/{tmdbId}
 ///   tv / anime         → KnownExternalIds["tvdb"] (raw TVDB numeric ID)  → /v3.2/tv/{tvdbId}
+///                        (seasons fall back to KnownExternalIds["parent_tvdb"])
 ///   music (level 0)    → KnownExternalIds["musicbrainz"] (artist MBID)   → /v3.2/music/{artistMbid}
-///   music (level 1+)   → parent's KnownExternalIds["musicbrainz"] (artist MBID), album MBID
-///                         used to select the correct album from the artist response
+///   music (level 1)    → KnownExternalIds["parent_musicbrainz"] (artist) +
+///                         KnownExternalIds["musicbrainz"] (release-group)
 ///
 /// External ID format stored by this plugin:
-///   "movie:{tmdbId}"        for movies and fan edits
-///   "tv:{tvdbId}"           for TV shows and anime  (TVDB IDs, NOT TMDB)
-///   "artist:{artistMbid}"   for music artists
-///   "album:{artistMbid}/{releaseGroupMbid}"  for music albums
+///   "movie:{tmdbId}"                           for movies and fan edits
+///   "tv:{tvdbId}"                              for TV shows and anime (TVDB IDs, NOT TMDB)
+///   "artist:{artistMbid}"                      for music artists
+///   "album:{artistMbid}/{releaseGroupMbid}"    for music albums
 ///
 /// TV items only receive artwork if a TVDB ID is available in media_external_ids
 /// (populated by Trakt/SIMKL sync). Items enriched only by TMDB will be NotFound
@@ -33,7 +36,7 @@ namespace Chronicle.Plugin.FanartTV;
 /// If none of the required cross-reference IDs are available, SearchAsync returns empty
 /// and the enrichment service marks the row as NotFound for this provider.
 /// </summary>
-public sealed class FanartTvMetadataProvider : IMetadataProvider
+public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
 {
     // ── IMetadataProvider identity ────────────────────────────────────────────
 
@@ -51,17 +54,36 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
     // ── Live configuration ────────────────────────────────────────────────────
 
     private FanartTvClient? _client;
+    private HttpClient? _ownedHttpClient;     // disposed when reconfigured or when provider is disposed
     private string _preferredLanguage = "en";
+    private readonly ILogger<FanartTvMetadataProvider> _logger;
+
+    // Short-lived result cache: avoids a redundant second HTTP call when the enrichment
+    // service calls GetByIdAsync immediately after SearchAsync has already fetched the
+    // same Fanart.tv ID in the same enrichment pipeline run.
+    // Single volatile field provides an atomic snapshot — all three values are read
+    // or written together, preventing torn reads under concurrent access.
+    private static readonly long CacheTtlTicks = 30L * TimeSpan.TicksPerSecond;
+    private sealed record CacheEntry(string Id, MediaMetadata Result, long ExpiresAtTicks);
+    private volatile CacheEntry? _cache;
+
+    /// <summary>Required for public instantiation by the host (no-arg).</summary>
+    public FanartTvMetadataProvider()
+        : this(NullLogger<FanartTvMetadataProvider>.Instance) { }
+
+    /// <summary>Constructor for DI or test injection.</summary>
+    public FanartTvMetadataProvider(ILogger<FanartTvMetadataProvider> logger)
+    {
+        _logger = logger;
+    }
 
     /// <summary>Test-only constructor that injects a pre-built client.</summary>
     internal FanartTvMetadataProvider(FanartTvClient client, string language = "en")
+        : this(NullLogger<FanartTvMetadataProvider>.Instance)
     {
-        _client           = client;
+        _client            = client;
         _preferredLanguage = language;
     }
-
-    /// <summary>Required for public instantiation by the host (no-arg).</summary>
-    public FanartTvMetadataProvider() { }
 
     // ── IMetadataProvider: static declarations ────────────────────────────────
 
@@ -175,12 +197,19 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
             throw new InvalidOperationException(
                 "Fanart.tv plugin requires 'api_key' to be configured.");
 
+        // Dispose the previous HttpClient before creating a new one to avoid socket exhaustion
+        // when Configure() is called more than once (e.g. user saves new settings).
+        _ownedHttpClient?.Dispose();
+
         var http = new HttpClient
         {
             DefaultRequestHeaders = { { "User-Agent", "Chronicle/1.0" } }
         };
-        _client           = new FanartTvClient(http, apiKey, clientKey);
+        _ownedHttpClient   = http;
+        _client            = new FanartTvClient(http, apiKey, clientKey, _logger);
         _preferredLanguage = string.IsNullOrWhiteSpace(language) ? "en" : language.Trim();
+        _logger.LogInformation("Fanart.tv plugin configured (preferred language: {Language})",
+            _preferredLanguage);
     }
 
     // ── IMetadataProvider: search ─────────────────────────────────────────────
@@ -211,15 +240,35 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
 
         var resolvedId = ResolveExternalId(context);
         if (resolvedId is null)
+        {
+            _logger.LogDebug(
+                "Fanart.tv: no cross-reference ID available for item '{Name}' " +
+                "(type={Type}, level={Level}). Skipping.",
+                context.Name, context.MediaTypeName, context.HierarchyLevel);
             return [];
+        }
 
-        // We already know the Fanart.tv lookup ID — fetch full data immediately.
-        // Return as a single 100-score candidate so the enrichment service short-circuits
-        // to GetByIdAsync without a second network call.
-        var metadata = await FetchByResolvedIdAsync(resolvedId, context.ItemNumber, ct);
+        _logger.LogDebug("Fanart.tv: resolved external ID '{Id}' for item '{Name}'",
+            resolvedId, context.Name);
+
+        // Fetch immediately — Fanart.tv has no search endpoint, so we already know
+        // the exact lookup ID. Cache the result so the enrichment service's subsequent
+        // GetByIdAsync call for the same ID does not make a redundant second HTTP request.
+        //
+        // Pass seasonNumber only for season items (level 1). For episodes (level 2) we
+        // have no season number in context — ItemNumber is the episode number — so pass
+        // null and let the fetch fall back to series-wide artwork.
+        var seasonNumber = context.HierarchyLevel == 1 ? context.ItemNumber : null;
+        var metadata = await FetchByResolvedIdAsync(resolvedId, seasonNumber, ct)
+                            .ConfigureAwait(false);
         if (metadata is null)
+        {
+            _logger.LogDebug("Fanart.tv: ID '{Id}' not found for item '{Name}'",
+                resolvedId, context.Name);
             return [];
+        }
 
+        StoreInCache(resolvedId, metadata);
         return [new ScoredCandidate(metadata, 100, "cross-reference ID match")];
     }
 
@@ -227,51 +276,70 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
     /// Fetches artwork by a previously-stored Fanart.tv external ID.
     /// Supports "movie:{id}", "tv:{tvdbId}", "artist:{mbid}", "album:{artistMbid}/{rgMbid}" formats.
     /// Also accepts Fanart.tv web URLs for Fix Match convenience:
-    ///   https://fanart.tv/movie/550/   → movie:550
+    ///   https://fanart.tv/movie/550/    → movie:550
     ///   https://fanart.tv/series/76290/ → tv:76290
     ///   https://fanart.tv/music/{mbid}/ → artist:{mbid}
-    /// Returns an empty <see cref="MediaMetadata"/> when the ID is not found on Fanart.tv.
     /// </summary>
     public async Task<MediaMetadata> GetByIdAsync(string externalId, CancellationToken ct = default)
     {
         EnsureConfigured();
         externalId = NormalizeFanartUrl(externalId);
-        return await FetchByResolvedIdAsync(externalId, seasonNumber: null, ct)
-               ?? new MediaMetadata { ExternalId = externalId };
+
+        // Return cached result from a preceding SearchAsync call for the same ID
+        // without making a second HTTP request.
+        var cached = TryGetFromCache(externalId);
+        if (cached is not null)
+        {
+            _logger.LogDebug("Fanart.tv: returning cached result for ID '{Id}'", externalId);
+            return cached;
+        }
+
+        var metadata = await FetchByResolvedIdAsync(externalId, seasonNumber: null, ct)
+                            .ConfigureAwait(false);
+
+        if (metadata is null)
+        {
+            // Fanart.tv returned 404 for a previously-stored ID. Log and return an empty
+            // result (the enrichment service will mark the row Completed with no artwork).
+            // This can happen when an item is removed from Fanart.tv. A future resync will
+            // update the record when / if it reappears.
+            _logger.LogWarning(
+                "Fanart.tv: ID '{Id}' returned 404. " +
+                "Storing empty result — run Re-sync All Artwork if the item is added to Fanart.tv.",
+                externalId);
+            return new MediaMetadata { ExternalId = externalId };
+        }
+
+        _logger.LogDebug("Fanart.tv: fetched artwork for ID '{Id}'", externalId);
+        return metadata;
     }
 
     /// <summary>
-    /// Converts a Fanart.tv web URL into the plugin's internal ID format.
-    /// Passes through anything that is already in internal format.
-    /// </summary>
-    private static string NormalizeFanartUrl(string input)
-    {
-        if (!input.StartsWith("http", StringComparison.OrdinalIgnoreCase))
-            return input;
-
-        var movieMatch = _fanartMovieUrlRe.Match(input);
-        if (movieMatch.Success) return $"movie:{movieMatch.Groups[1].Value}";
-
-        var seriesMatch = _fanartSeriesUrlRe.Match(input);
-        if (seriesMatch.Success) return $"tv:{seriesMatch.Groups[1].Value}";
-
-        var musicMatch = _fanartMusicUrlRe.Match(input);
-        if (musicMatch.Success) return $"artist:{musicMatch.Groups[1].Value}";
-
-        return input; // unrecognised URL — pass through, will fail gracefully
-    }
-
-    /// <summary>
-    /// Fanart.tv does not provide image downloads — images are direct CDN URLs.
-    /// This method is not used; return empty.
+    /// Fanart.tv does not provide image downloads — all images are direct CDN URLs
+    /// that the host fetches itself. Calling this method is a logic error.
     /// </summary>
     public Task<byte[]> GetImageAsync(string url, CancellationToken ct = default)
-        => Task.FromResult(Array.Empty<byte>());
+        => throw new NotSupportedException(
+            "Fanart.tv provides direct CDN image URLs; GetImageAsync is not required. " +
+            "Use the URL from PosterUrl / BackdropUrl / LogoUrl etc. directly.");
 
     public async Task<bool> HealthCheckAsync(CancellationToken ct = default)
     {
-        if (_client is null) return false;
-        return await _client.HealthCheckAsync(ct);
+        if (_client is null)
+        {
+            _logger.LogWarning("Fanart.tv health check skipped — plugin not configured");
+            return false;
+        }
+        return await _client.HealthCheckAsync(ct).ConfigureAwait(false);
+    }
+
+    // ── IDisposable ───────────────────────────────────────────────────────────
+
+    public void Dispose()
+    {
+        _ownedHttpClient?.Dispose();
+        _ownedHttpClient = null;
+        _client          = null;
     }
 
     // ── ID resolution ─────────────────────────────────────────────────────────
@@ -282,10 +350,12 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
     ///
     /// Priority per media type:
     ///   movies / fanedits → KnownExternalIds["tmdb"] value, strip "movie:" prefix → "movie:{id}"
-    ///   tv / anime        → KnownExternalIds["tvdb"]        → "tv:{tvdbId}"
-    ///   music (artist)    → KnownExternalIds["musicbrainz"] → "artist:{mbid}"
-    ///   music (album, level 1) → KnownExternalIds["musicbrainz"] (release-group) → "artist:{artistMbid}"
-    ///                            (album art is embedded inside the artist response)
+    ///   tv / anime        → KnownExternalIds["tvdb"] (own or parent_tvdb for seasons) → "tv:{tvdbId}"
+    ///   music (level 0)   → KnownExternalIds["musicbrainz"] (artist MBID) → "artist:{mbid}"
+    ///   music (level 1)   → KnownExternalIds["musicbrainz"] (release-group) +
+    ///                        KnownExternalIds["parent_musicbrainz"] (artist MBID)
+    ///                        → "album:{artistMbid}/{rgMbid}"
+    ///   music (level 2+)  → null (tracks have no Fanart.tv artwork)
     /// </summary>
     private static string? ResolveExternalId(MediaSearchContext context)
     {
@@ -312,8 +382,9 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
             if (known.TryGetValue("parent_tvdb", out var parentTvdbId) && !string.IsNullOrWhiteSpace(parentTvdbId))
                 return $"tv:{parentTvdbId}";
         }
-        else if (mediaType is "music" or null)
+        else if (mediaType is "music")
         {
+            // Explicit type guard — do not fall into music logic for unknown types.
             if (context.HierarchyLevel == 0)
             {
                 // Root level = artist. MusicBrainz stores "artist:{mbid}".
@@ -328,12 +399,9 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
                 // Album level. We need:
                 //   - the artist's MBID (to call /v3.2/music/{artistMbid})
                 //   - the release-group MBID (to select the album in the response)
-                // The album item itself stores a release-group MBID. The parent artist
-                // stores the artist MBID. We use ParentExternalId convention: the enrichment
-                // service stores the parent's musicbrainz ID in KnownExternalIds under
-                // "parent_musicbrainz" when it populates the context.
-                // Fallback: if both artist and release-group MBIDs are in KnownExternalIds
-                // (e.g. populated from media_external_ids with multiple rows), use them.
+                // The album item itself stores a release-group MBID in its own external IDs.
+                // The parent artist's MBID is injected as "parent_musicbrainz" by the
+                // enrichment service from the parent's media_external_ids.
                 known.TryGetValue("musicbrainz", out var albumMbId);
                 known.TryGetValue("parent_musicbrainz", out var artistMbId);
 
@@ -343,12 +411,12 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
                 if (artistMbid is not null && albumMbid is not null)
                     return $"album:{artistMbid}/{albumMbid}";
 
-                // If we only have one MBID and it's an artist MBID (no release-group available),
-                // fall back to artist-level artwork.
+                // If we only have the artist MBID (no release-group), fall back to
+                // artist-level artwork which at least gives the artist poster/backdrop.
                 if (artistMbid is not null)
                     return $"artist:{artistMbid}";
             }
-            // Tracks (level 2) have no useful Fanart.tv artwork — skip.
+            // Tracks (level 2+) have no Fanart.tv artwork — skip.
         }
 
         return null;
@@ -371,7 +439,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
     /// <summary>Extracts a MusicBrainz UUID from "artist:{mbid}", "release-group:{mbid}", or a bare UUID.</summary>
     private static string? ExtractMbid(string rawId)
     {
-        var colonIdx = rawId.LastIndexOf(':');
+        var colonIdx = rawId.IndexOf(':');   // use IndexOf — prefix is always "word:", UUID never contains ':'
         if (colonIdx >= 0)
         {
             var after = rawId[(colonIdx + 1)..].Trim();
@@ -391,27 +459,28 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
         var albumMatch  = _albumIdRe.Match(resolvedId);
 
         if (movieMatch.Success)
-            return await FetchMovieAsync(movieMatch.Groups[1].Value, resolvedId, ct);
+            return await FetchMovieAsync(movieMatch.Groups[1].Value, resolvedId, ct).ConfigureAwait(false);
 
         if (tvMatch.Success)
-            return await FetchTvAsync(tvMatch.Groups[1].Value, resolvedId, seasonNumber, ct);
+            return await FetchTvAsync(tvMatch.Groups[1].Value, resolvedId, seasonNumber, ct).ConfigureAwait(false);
 
         if (albumMatch.Success)
             return await FetchAlbumAsync(
                 albumMatch.Groups[1].Value,   // artistMbid
                 albumMatch.Groups[2].Value,   // releaseGroupMbid
-                resolvedId, ct);
+                resolvedId, ct).ConfigureAwait(false);
 
         if (artistMatch.Success)
-            return await FetchArtistAsync(artistMatch.Groups[1].Value, resolvedId, ct);
+            return await FetchArtistAsync(artistMatch.Groups[1].Value, resolvedId, ct).ConfigureAwait(false);
 
+        _logger.LogWarning("Fanart.tv: unrecognised external ID format '{Id}'", resolvedId);
         return null;
     }
 
     private async Task<MediaMetadata?> FetchMovieAsync(
         string tmdbId, string externalId, CancellationToken ct)
     {
-        var response = await _client!.GetMovieAsync(tmdbId, ct);
+        var response = await _client!.GetMovieAsync(tmdbId, ct).ConfigureAwait(false);
         if (response is null) return null;
 
         var poster   = BestImage(response.MoviePosters);
@@ -422,25 +491,32 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
         var clearart = BestImage(response.HdMovieClearArts) ?? BestImage(response.MovieArts);
         var thumb    = BestImage(response.MovieThumbs);
 
+        _logger.LogDebug(
+            "Fanart.tv movie {TmdbId}: poster={Poster}, backdrop={Backdrop}, logo={Logo}",
+            tmdbId,
+            poster?.Url is not null ? "yes" : "no",
+            backdrop?.Url is not null ? "yes" : "no",
+            logo?.Url is not null ? "yes" : "no");
+
         return new MediaMetadata
         {
-            ExternalId    = externalId,
-            Source        = "fanarttv",
-            Title         = response.Name ?? string.Empty,
-            PosterUrl     = poster?.Url,
-            BackdropUrl   = backdrop?.Url,
-            LogoUrl       = logo?.Url,
-            BannerUrl     = banner?.Url,
-            DiscUrl       = disc?.Url,
-            ClearartUrl   = clearart?.Url,
-            ThumbUrl      = thumb?.Url,
+            ExternalId  = externalId,
+            Source      = "fanarttv",
+            Title       = response.Name ?? string.Empty,
+            PosterUrl   = poster?.Url,
+            BackdropUrl = backdrop?.Url,
+            LogoUrl     = logo?.Url,
+            BannerUrl   = banner?.Url,
+            DiscUrl     = disc?.Url,
+            ClearartUrl = clearart?.Url,
+            ThumbUrl    = thumb?.Url,
         };
     }
 
     private async Task<MediaMetadata?> FetchTvAsync(
         string tvdbId, string externalId, int? seasonNumber, CancellationToken ct)
     {
-        var response = await _client!.GetTvShowAsync(tvdbId, ct);
+        var response = await _client!.GetTvShowAsync(tvdbId, ct).ConfigureAwait(false);
         if (response is null) return null;
 
         var poster   = BestImage(response.TvPosters);
@@ -458,6 +534,12 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
         var seasonThumb = seasonNumber.HasValue
             ? BestSeasonImage(response.SeasonThumbs, seasonNumber.Value)
             : null;
+
+        _logger.LogDebug(
+            "Fanart.tv TV {TvdbId} (season={Season}): poster={Poster}, logo={Logo}",
+            tvdbId, seasonNumber?.ToString() ?? "show",
+            (seasonPoster ?? poster)?.Url is not null ? "yes" : "no",
+            logo?.Url is not null ? "yes" : "no");
 
         return new MediaMetadata
         {
@@ -477,7 +559,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
     private async Task<MediaMetadata?> FetchArtistAsync(
         string artistMbid, string externalId, CancellationToken ct)
     {
-        var response = await _client!.GetArtistAsync(artistMbid, ct);
+        var response = await _client!.GetArtistAsync(artistMbid, ct).ConfigureAwait(false);
         if (response is null) return null;
 
         var thumb    = BestImage(response.ArtistThumbs);
@@ -486,47 +568,23 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
         var banner   = BestImage(response.MusicBanners);
         var clearart = BestImage(response.HdMusicArts) ?? BestImage(response.MusicArts);
 
-        // Build per-album art map so child album items can retrieve cover art
-        // by their MusicBrainz release-group MBID.
-        Dictionary<string, object?>? albumArt = null;
-        if (response.Albums is { Count: > 0 })
-        {
-            albumArt = [];
-            foreach (var (rgMbid, album) in response.Albums)
-            {
-                var cover = BestImage(album.AlbumCovers);
-                var cdart = BestImage(album.CdArts);
-                if (cover is not null || cdart is not null)
-                {
-                    albumArt[rgMbid] = new Dictionary<string, string?>
-                    {
-                        ["cover_url"] = cover?.Url,
-                        ["cdart_url"] = cdart?.Url,
-                    };
-                }
-            }
-        }
-
-        // Serialise album art map into ExtendedData so it's preserved in metadata_json
-        // for future UI use (e.g. showing album cover per-album child item).
-        JsonElement? extendedData = null;
-        if (albumArt is { Count: > 0 })
-        {
-            var json = JsonSerializer.Serialize(new { albums = albumArt });
-            extendedData = JsonDocument.Parse(json).RootElement;
-        }
+        _logger.LogDebug(
+            "Fanart.tv artist {ArtistMbid}: thumb={Thumb}, logo={Logo}, albums={AlbumCount}",
+            artistMbid,
+            thumb?.Url is not null ? "yes" : "no",
+            logo?.Url is not null ? "yes" : "no",
+            response.Albums?.Count ?? 0);
 
         return new MediaMetadata
         {
-            ExternalId   = externalId,
-            Source       = "fanarttv",
-            Title        = response.Name ?? string.Empty,
-            PosterUrl    = thumb?.Url,
-            BackdropUrl  = backdrop?.Url,
-            LogoUrl      = logo?.Url,
-            BannerUrl    = banner?.Url,
-            ClearartUrl  = clearart?.Url,
-            ExtendedData = extendedData,
+            ExternalId  = externalId,
+            Source      = "fanarttv",
+            Title       = response.Name ?? string.Empty,
+            PosterUrl   = thumb?.Url,
+            BackdropUrl = backdrop?.Url,
+            LogoUrl     = logo?.Url,
+            BannerUrl   = banner?.Url,
+            ClearartUrl = clearart?.Url,
         };
     }
 
@@ -538,7 +596,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
     private async Task<MediaMetadata?> FetchAlbumAsync(
         string artistMbid, string releaseGroupMbid, string externalId, CancellationToken ct)
     {
-        var response = await _client!.GetArtistAsync(artistMbid, ct);
+        var response = await _client!.GetArtistAsync(artistMbid, ct).ConfigureAwait(false);
         if (response is null) return null;
 
         FanartAlbum? album = null;
@@ -547,17 +605,66 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
         var cover = BestImage(album?.AlbumCovers);
         var cdart = BestImage(album?.CdArts);
 
-        // If this specific album has no art, still return a result so the row is marked
-        // Completed rather than left Pending indefinitely. Artwork may be added to Fanart.tv later
-        // and a resync will pick it up.
+        _logger.LogDebug(
+            "Fanart.tv album {RgMbid} (artist {ArtistMbid}): cover={Cover}, cdart={Cdart}",
+            releaseGroupMbid, artistMbid,
+            cover?.Url is not null ? "yes" : "no",
+            cdart?.Url is not null ? "yes" : "no");
+
+        // If this specific album has no art on Fanart.tv yet, still return a result so the
+        // enrichment row is marked Completed rather than left Pending indefinitely.
+        // A scheduled Re-sync All Artwork task will pick up new community-submitted images.
         return new MediaMetadata
         {
             ExternalId = externalId,
             Source     = "fanarttv",
-            Title      = string.Empty,    // title not available from album art response
+            Title      = string.Empty,    // title not available from the album art response
             PosterUrl  = cover?.Url,
             DiscUrl    = cdart?.Url,
         };
+    }
+
+    // ── Result cache helpers ──────────────────────────────────────────────────
+
+    private void StoreInCache(string id, MediaMetadata result)
+    {
+        _cache = new CacheEntry(id, result, DateTime.UtcNow.Ticks + CacheTtlTicks);
+    }
+
+    private MediaMetadata? TryGetFromCache(string id)
+    {
+        var entry = _cache;   // single volatile read — snapshot
+        if (entry is not null
+            && entry.Id == id
+            && DateTime.UtcNow.Ticks < entry.ExpiresAtTicks)
+        {
+            return entry.Result;
+        }
+        return null;
+    }
+
+    // ── URL normalisation ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Converts a Fanart.tv web URL into the plugin's internal ID format.
+    /// Passes through anything that is already in internal format.
+    /// </summary>
+    private static string NormalizeFanartUrl(string input)
+    {
+        if (!input.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+            !input.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            return input;
+
+        var movieMatch = _fanartMovieUrlRe.Match(input);
+        if (movieMatch.Success) return $"movie:{movieMatch.Groups[1].Value}";
+
+        var seriesMatch = _fanartSeriesUrlRe.Match(input);
+        if (seriesMatch.Success) return $"tv:{seriesMatch.Groups[1].Value}";
+
+        var musicMatch = _fanartMusicUrlRe.Match(input);
+        if (musicMatch.Success) return $"artist:{musicMatch.Groups[1].Value}";
+
+        return input; // unrecognised URL — pass through, will fail gracefully in FetchByResolvedIdAsync
     }
 
     // ── Image selection helpers ───────────────────────────────────────────────
@@ -626,18 +733,26 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
             .FirstOrDefault();
     }
 
+    /// <summary>
+    /// Returns a score for image language selection priority.
+    /// Higher score = preferred. Tiebreaker is likes count.
+    ///   3 = user's preferred language
+    ///   2 = English (broadly understood fallback)
+    ///   1 = language-neutral ("00" or empty — lower quality on average)
+    ///   0 = other language
+    /// </summary>
     private int LanguageScore(string? lang)
     {
-        if (string.IsNullOrEmpty(lang) || lang == "00") return 2;   // language-neutral
         if (string.Equals(lang, _preferredLanguage, StringComparison.OrdinalIgnoreCase)) return 3;
-        if (string.Equals(lang, "en", StringComparison.OrdinalIgnoreCase)) return 1;
+        if (string.Equals(lang, "en", StringComparison.OrdinalIgnoreCase)) return 2;
+        if (string.IsNullOrEmpty(lang) || lang == "00") return 1;   // language-neutral
         return 0;
     }
 
     private static int ParseInt(string? s) =>
         int.TryParse(s, out var n) ? n : 0;
 
-    // ── Metadata helpers ──────────────────────────────────────────────────────
+    // ── Guard ─────────────────────────────────────────────────────────────────
 
     private void EnsureConfigured()
     {

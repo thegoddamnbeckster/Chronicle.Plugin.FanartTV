@@ -6,7 +6,7 @@
   "description": "Fetches high-quality artwork from Fanart.tv — posters, backgrounds, logos, disc art, clearart, and banners for movies, TV, and music. Requires a free Fanart.tv API key.",
   "min_chronicle_version": "0.1.0",
   "entry_type": "Chronicle.Plugin.FanartTV.FanartTvMetadataProvider",
-  "fixMatchHint": "Movies: enter a TMDB ID or URL — movie:550 or https://fanart.tv/movie/550/. TV: enter a TVDB ID — tv:76290 (TVDB, not TMDB). Music: enter a MusicBrainz artist MBID — artist:b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d.",
+  "fixMatchHint": "Movies: enter a TMDB ID or URL — movie:550 or https://fanart.tv/movie/550/. TV: enter a TVDB ID — tv:76290 (TVDB, not TMDB). Music artists: artist:b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d. Albums: album:{artistMbid}/{releaseGroupMbid} — Fanart.tv has no album-specific URL, so URLs cannot be used for album Fix Match.",
   "iconUrl": "https://fanart.tv/favicon.ico",
   "brandColorLight": "#F5A623",
   "brandColorDark":  "#c4841a",

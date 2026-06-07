@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 
 namespace Chronicle.Plugin.FanartTV;
 
@@ -26,15 +27,18 @@ internal sealed class FanartTvClient
     private readonly HttpClient _http;
     private readonly string _apiKey;
     private readonly string? _clientKey;
+    private readonly ILogger _logger;
 
-    /// <param name="http">Shared HttpClient — caller controls lifetime.</param>
+    /// <param name="http">Owned HttpClient — caller controls lifetime.</param>
     /// <param name="apiKey">Fanart.tv project API key (required).</param>
     /// <param name="clientKey">Fanart.tv personal API key (optional, unlocks recent images).</param>
-    public FanartTvClient(HttpClient http, string apiKey, string? clientKey = null)
+    /// <param name="logger">Logger for HTTP diagnostics.</param>
+    public FanartTvClient(HttpClient http, string apiKey, string? clientKey, ILogger logger)
     {
         _http      = http;
         _apiKey    = apiKey;
         _clientKey = clientKey;
+        _logger    = logger;
     }
 
     // ── Movie ─────────────────────────────────────────────────────────────────
@@ -74,11 +78,12 @@ internal sealed class FanartTvClient
     {
         try
         {
-            var result = await GetMovieAsync("550", ct);
+            var result = await GetMovieAsync("550", ct).ConfigureAwait(false);
             return result is not null;
         }
-        catch
+        catch (Exception ex)
         {
+            _logger.LogWarning(ex, "Fanart.tv health check failed");
             return false;
         }
     }
@@ -88,28 +93,45 @@ internal sealed class FanartTvClient
     private async Task<T?> GetAsync<T>(string url, CancellationToken ct) where T : class
     {
         var fullUrl = AppendKeys(url);
-        using var response = await _http.GetAsync(fullUrl, ct);
+        _logger.LogDebug("Fanart.tv GET {Url}", url); // log without keys for security
+
+        using var response = await _http.GetAsync(fullUrl, ct).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            _logger.LogDebug("Fanart.tv 404 for {Url}", url);
             return null;
+        }
 
         if (response.StatusCode == HttpStatusCode.Unauthorized ||
             response.StatusCode == HttpStatusCode.Forbidden)
+        {
+            _logger.LogError("Fanart.tv rejected the API key (HTTP {Status}) for {Url}",
+                (int)response.StatusCode, url);
             throw new InvalidOperationException(
                 "Fanart.tv rejected the API key. Check your api_key in plugin settings.");
+        }
 
         if (response.StatusCode == (HttpStatusCode)429)
         {
-            // Respect Retry-After if present, then propagate as transient failure.
             var retryAfter = response.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(10);
-            await Task.Delay(retryAfter, ct);
+            _logger.LogWarning("Fanart.tv rate limit hit (429) for {Url}. Retry-After: {Delay}s",
+                url, retryAfter.TotalSeconds);
+            // Respect Retry-After, then propagate as transient failure so the
+            // enrichment service marks the row as Failed and retries at next scheduled task.
+            await Task.Delay(retryAfter, ct).ConfigureAwait(false);
             throw new HttpRequestException("Fanart.tv rate limit hit (429). Retry later.");
         }
 
-        response.EnsureSuccessStatusCode();
+        if (!response.IsSuccessStatusCode)
+        {
+            _logger.LogWarning("Fanart.tv returned unexpected HTTP {Status} for {Url}",
+                (int)response.StatusCode, url);
+            response.EnsureSuccessStatusCode(); // throws HttpRequestException with status details
+        }
 
-        await using var stream = await response.Content.ReadAsStreamAsync(ct);
-        return await JsonSerializer.DeserializeAsync<T>(stream, _jsonOptions, ct);
+        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        return await JsonSerializer.DeserializeAsync<T>(stream, _jsonOptions, ct).ConfigureAwait(false);
     }
 
     private string AppendKeys(string url)
