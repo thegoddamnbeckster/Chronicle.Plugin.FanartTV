@@ -7,9 +7,9 @@
   "min_chronicle_version": "0.1.0",
   "entry_type": "Chronicle.Plugin.FanartTV.FanartTvMetadataProvider",
   "fixMatchHint": "Movies: enter a TMDB ID or URL — movie:550 or https://fanart.tv/movie/550/. TV: enter a TVDB ID — tv:76290 (TVDB, not TMDB). Music artists: artist:b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d. Albums: album:{artistMbid}/{releaseGroupMbid} — Fanart.tv has no album-specific URL, so URLs cannot be used for album Fix Match.",
-  "iconUrl": "https://fanart.tv/favicon.ico",
-  "brandColorLight": "#F5A623",
-  "brandColorDark":  "#c4841a",
+  "iconUrl": "https://fanart.tv/icon.svg",
+  "brandColorLight": "#1499c2",
+  "brandColorDark":  "#19b7e4",
   "background_tasks": [
     {
       "task_id":         "fetch-missing-metadata",
