@@ -1,6 +1,6 @@
 # Chronicle.Plugin.FanartTV
 
-[![Latest Release](https://img.shields.io/github/v/release/thegoddamnbeckster/Chronicle.Plugin.FanartTV?label=Chronicle.Plugin.FanartTV&color=F5A623)](https://github.com/thegoddamnbeckster/Chronicle.Plugin.FanartTV/releases/latest)
+[![Latest Release](https://img.shields.io/github/v/release/thegoddamnbeckster/Chronicle.Plugin.FanartTV?style=flat-square&label=release&color=19b7e4)](https://github.com/thegoddamnbeckster/Chronicle.Plugin.FanartTV/releases/latest)
 
 High-quality artwork plugin for [Chronicle](https://github.com/thegoddamnbeckster/Chronicle) powered by [Fanart.tv](https://fanart.tv/).
 
