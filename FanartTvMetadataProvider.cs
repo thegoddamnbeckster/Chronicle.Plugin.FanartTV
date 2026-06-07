@@ -65,7 +65,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
             MediaTypeName   = "movies",
             DisplayName     = "Movies",
             HierarchyLevels = 1,
-            DefaultPriority = 20,  // lower priority than TMDB; supplements, not replaces
+            DefaultPriority = 20,  // supplements TMDB; lower priority so TMDB wins title/overview
             SupportedFields = ["poster_url", "backdrop_url", "logo_url", "banner_url",
                                "disc_url", "clearart_url", "thumb_url"],
         },
@@ -117,7 +117,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
                                 "clearart_url", "thumb_url"],
             LevelFields = new Dictionary<int, List<string>>
             {
-                [1] = ["poster_url", "disc_url"],   // album cover + cd art
+                [1] = ["poster_url", "disc_url"],   // album cover + CD art
             },
         },
     ];
@@ -346,18 +346,15 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
 
         return new MediaMetadata
         {
-            ExternalId      = externalId,
-            Title           = response.Name ?? string.Empty,
-            PosterUrl       = poster?.Url,
-            BackdropUrl     = backdrop?.Url,
-            AdditionalImages = BuildAdditionalImages(new()
-            {
-                ["logo"]     = logo?.Url,
-                ["banner"]   = banner?.Url,
-                ["disc"]     = disc?.Url,
-                ["clearart"] = clearart?.Url,
-                ["thumb"]    = thumb?.Url,
-            }),
+            ExternalId    = externalId,
+            Title         = response.Name ?? string.Empty,
+            PosterUrl     = poster?.Url,
+            BackdropUrl   = backdrop?.Url,
+            LogoUrl       = logo?.Url,
+            BannerUrl     = banner?.Url,
+            DiscUrl       = disc?.Url,
+            ClearartUrl   = clearart?.Url,
+            ThumbUrl      = thumb?.Url,
         };
     }
 
@@ -389,14 +386,11 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
             Title           = response.Name ?? string.Empty,
             PosterUrl       = seasonPoster?.Url ?? poster?.Url,
             BackdropUrl     = backdrop?.Url,
-            AdditionalImages = BuildAdditionalImages(new()
-            {
-                ["logo"]          = logo?.Url,
-                ["banner"]        = banner?.Url,
-                ["clearart"]      = clearart?.Url,
-                ["thumb"]         = seasonThumb?.Url ?? thumb?.Url,
-                ["character_art"] = charArt?.Url,
-            }),
+            LogoUrl         = logo?.Url,
+            BannerUrl       = banner?.Url,
+            ClearartUrl     = clearart?.Url,
+            ThumbUrl        = seasonThumb?.Url ?? thumb?.Url,
+            CharacterArtUrl = charArt?.Url,
         };
     }
 
@@ -433,7 +427,8 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
             }
         }
 
-        // Serialise album art map into ExtendedData so the enrichment service stores it in metadata_json
+        // Serialise album art map into ExtendedData so it's preserved in metadata_json
+        // for future UI use (e.g. showing album cover per-album child item).
         JsonElement? extendedData = null;
         if (albumArt is { Count: > 0 })
         {
@@ -443,17 +438,14 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
 
         return new MediaMetadata
         {
-            ExternalId      = externalId,
-            Title           = response.Name ?? string.Empty,
-            PosterUrl       = thumb?.Url,
-            BackdropUrl     = backdrop?.Url,
-            ExtendedData    = extendedData,
-            AdditionalImages = BuildAdditionalImages(new()
-            {
-                ["logo"]     = logo?.Url,
-                ["banner"]   = banner?.Url,
-                ["clearart"] = clearart?.Url,
-            }),
+            ExternalId   = externalId,
+            Title        = response.Name ?? string.Empty,
+            PosterUrl    = thumb?.Url,
+            BackdropUrl  = backdrop?.Url,
+            LogoUrl      = logo?.Url,
+            BannerUrl    = banner?.Url,
+            ClearartUrl  = clearart?.Url,
+            ExtendedData = extendedData,
         };
     }
 
@@ -535,22 +527,6 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider
         int.TryParse(s, out var n) ? n : 0;
 
     // ── Metadata helpers ──────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Converts a type→url map into <see cref="AdditionalImage"/> entries,
-    /// skipping null/empty URLs.
-    /// </summary>
-    private static List<AdditionalImage> BuildAdditionalImages(
-        Dictionary<string, string?> fields)
-    {
-        var list = new List<AdditionalImage>();
-        foreach (var (type, url) in fields)
-        {
-            if (!string.IsNullOrWhiteSpace(url))
-                list.Add(new AdditionalImage { Type = type, Url = url! });
-        }
-        return list;
-    }
 
     private void EnsureConfigured()
     {
