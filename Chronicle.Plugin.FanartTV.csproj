@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Chronicle.Plugin.FanartTV</AssemblyName>
+    <RootNamespace>Chronicle.Plugin.FanartTV</RootNamespace>
+    <!-- Plugin DLL must not copy Chronicle.Plugins into its output — it will be
+         provided by the host at runtime. Mark the reference as Private=false. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Local path reference during development.
+         Replace with NuGet package reference once Chronicle.Plugins is published. -->
+    <ProjectReference Include="..\Chronicle\src\Chronicle.Plugins\Chronicle.Plugins.csproj"
+                      Private="false"
+                      ExcludeAssets="runtime" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Http" Version="9.0.3" />
+    <PackageReference Include="System.Text.Json" Version="9.0.3" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <InternalsVisibleTo>Chronicle.Plugin.FanartTV.Tests</InternalsVisibleTo>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="tests/**" />
+  </ItemGroup>
+
+  <!-- Copy manifest.json to output directory so PluginHostService can read it -->
+  <ItemGroup>
+    <None Include="manifest.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
