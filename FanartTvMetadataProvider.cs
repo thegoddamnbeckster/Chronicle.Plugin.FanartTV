@@ -139,8 +139,8 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
         {
             MediaTypeName    = "music",
             DisplayName      = "Music",
-            HierarchyLevels  = 3,
-            HierarchyLabels  = ["Artist", "Album", "Track"],
+            HierarchyLevels  = 2,   // Fanart.tv has no per-track artwork — Artist (0) + Album (1) only
+            HierarchyLabels  = ["Artist", "Album"],
             DefaultPriority  = 20,
             SupportedFields  = ["poster_url", "backdrop_url", "logo_url", "banner_url",
                                 "clearart_url", "thumb_url"],
@@ -223,7 +223,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
     // Fanart.tv URL patterns for Fix Match normalization
     private static readonly Regex _fanartMovieUrlRe  = new(@"fanart\.tv/movie/(\d+)",   RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _fanartSeriesUrlRe = new(@"fanart\.tv/series/(\d+)",  RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex _fanartMusicUrlRe  = new(@"fanart\.tv/music/([0-9a-f-]{36})", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _fanartMusicUrlRe  = new(@"fanart\.tv/(?:music|artist)/([0-9a-f-]{36})", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     /// <summary>
     /// Fanart.tv has no text-search endpoint, so this method resolves by cross-referencing
@@ -757,7 +757,8 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
     private void EnsureConfigured()
     {
         if (_client is null)
-            throw new InvalidOperationException(
-                "Fanart.tv plugin is not configured. Call Configure() first.");
+            throw new Chronicle.Plugins.PluginAuthException(
+                "chronicle.plugin.fanarttv",
+                "Fanart.tv plugin is not configured — set an API key in Settings → Plugins → Fanart.tv.");
     }
 }

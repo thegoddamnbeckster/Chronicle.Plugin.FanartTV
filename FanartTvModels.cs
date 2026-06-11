@@ -1,6 +1,38 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace Chronicle.Plugin.FanartTV;
+
+/// <summary>
+/// Handles Fanart.tv returning [] (empty JSON array) instead of {} when an artist has no albums.
+/// </summary>
+internal sealed class AlbumDictionaryConverter : JsonConverter<Dictionary<string, FanartAlbum>?>
+{
+    public override Dictionary<string, FanartAlbum>? Read(
+        ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType == JsonTokenType.StartArray)
+        {
+            // Skip the array entirely — Fanart.tv sends [] for artists with no album art
+            var depth = 1;
+            while (depth > 0 && reader.Read())
+            {
+                if (reader.TokenType == JsonTokenType.StartArray || reader.TokenType == JsonTokenType.StartObject) depth++;
+                else if (reader.TokenType == JsonTokenType.EndArray || reader.TokenType == JsonTokenType.EndObject) depth--;
+            }
+            return null;
+        }
+
+        if (reader.TokenType == JsonTokenType.Null)
+            return null;
+
+        return JsonSerializer.Deserialize<Dictionary<string, FanartAlbum>>(ref reader, options);
+    }
+
+    public override void Write(
+        Utf8JsonWriter writer, Dictionary<string, FanartAlbum>? value, JsonSerializerOptions options)
+        => JsonSerializer.Serialize(writer, value, options);
+}
 
 // ── Shared image record ───────────────────────────────────────────────────────
 
@@ -121,7 +153,9 @@ public sealed class FanartArtistResponse
     // SD music clear-art (~500×281)
     [JsonPropertyName("musicarts")]        public List<FanartImage>? MusicArts         { get; set; }
     // Per-album artwork (keyed by MusicBrainz release-group MBID)
+    // Fanart.tv returns [] (empty array) instead of {} when an artist has no albums — handled by converter.
     [JsonPropertyName("albums")]
+    [JsonConverter(typeof(AlbumDictionaryConverter))]
     public Dictionary<string, FanartAlbum>? Albums { get; set; }
 }
 
