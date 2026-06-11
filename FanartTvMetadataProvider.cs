@@ -215,14 +215,17 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
     // ── IMetadataProvider: search ─────────────────────────────────────────────
 
     // External ID patterns this plugin produces / consumes
-    private static readonly Regex _movieIdRe  = new(@"^movie:(\d+)$",     RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex _tvIdRe     = new(@"^tv:(\d+)$",        RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex _artistIdRe = new(@"^artist:([0-9a-f-]{36})$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
-    private static readonly Regex _albumIdRe  = new(@"^album:([0-9a-f-]{36})/([0-9a-f-]{36})$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _movieIdRe    = new(@"^movie:(\d+)$",                                       RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _tvIdRe       = new(@"^tv:(\d+)$",                                          RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _tvSeasonIdRe = new(@"^tv:(\d+)/season:(\d+)$",                             RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _artistIdRe   = new(@"^artist:([0-9a-f-]{36})$",                            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex _albumIdRe    = new(@"^album:([0-9a-f-]{36})/([0-9a-f-]{36})$",             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     // Fanart.tv URL patterns for Fix Match normalization
     private static readonly Regex _fanartMovieUrlRe  = new(@"fanart\.tv/movie/(\d+)",   RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _fanartSeriesUrlRe = new(@"fanart\.tv/series/(\d+)",  RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    // Album URL must be checked before artist URL (more specific path comes first)
+    private static readonly Regex _fanartAlbumUrlRe  = new(@"fanart\.tv/(?:music|artist)/([0-9a-f-]{36})/album/([0-9a-f-]{36})", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _fanartMusicUrlRe  = new(@"fanart\.tv/(?:music|artist)/([0-9a-f-]{36})", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     /// <summary>
@@ -387,9 +390,13 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
             // Explicit type guard — do not fall into music logic for unknown types.
             if (context.HierarchyLevel == 0)
             {
-                // Root level = artist. MusicBrainz stores "artist:{mbid}".
+                // Root level = artist. MusicBrainz stores "artist:{mbid}" or a bare UUID.
+                // Reject "release-group:{mbid}" — that ID would 404 on the artist endpoint.
                 if (known.TryGetValue("musicbrainz", out var mbId))
                 {
+                    var colon = mbId.IndexOf(':');
+                    if (colon >= 0 && !mbId.StartsWith("artist:", StringComparison.OrdinalIgnoreCase))
+                        return null; // wrong entity type for artist-level lookup
                     var mbid = ExtractMbid(mbId);
                     if (mbid is not null) return $"artist:{mbid}";
                 }
@@ -405,14 +412,25 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
                 known.TryGetValue("musicbrainz", out var albumMbId);
                 known.TryGetValue("parent_musicbrainz", out var artistMbId);
 
-                var albumMbid  = albumMbId  is not null ? ExtractMbid(albumMbId)  : null;
+                // Only accept "release-group:{mbid}" or bare UUID for the album slot —
+                // reject "artist:{mbid}" which the MusicBrainz plugin can store on album items
+                // when it matched at the artist level rather than the release-group level.
+                string? albumMbid = null;
+                if (albumMbId is not null)
+                {
+                    var colon = albumMbId.IndexOf(':');
+                    if (colon < 0 || albumMbId.StartsWith("release-group:", StringComparison.OrdinalIgnoreCase))
+                        albumMbid = ExtractMbid(albumMbId);
+                    // else: wrong prefix type (e.g. "artist:") — treat as not available
+                }
+
                 var artistMbid = artistMbId is not null ? ExtractMbid(artistMbId) : null;
 
                 if (artistMbid is not null && albumMbid is not null)
                     return $"album:{artistMbid}/{albumMbid}";
 
                 // If we only have the artist MBID (no release-group), fall back to
-                // artist-level artwork which at least gives the artist poster/backdrop.
+                // artist-level artwork which at least gives the artist backdrop/logo.
                 if (artistMbid is not null)
                     return $"artist:{artistMbid}";
             }
@@ -453,13 +471,22 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
     private async Task<MediaMetadata?> FetchByResolvedIdAsync(
         string resolvedId, int? seasonNumber, CancellationToken ct)
     {
-        var movieMatch  = _movieIdRe.Match(resolvedId);
-        var tvMatch     = _tvIdRe.Match(resolvedId);
-        var artistMatch = _artistIdRe.Match(resolvedId);
-        var albumMatch  = _albumIdRe.Match(resolvedId);
+        var movieMatch    = _movieIdRe.Match(resolvedId);
+        var tvSeasonMatch = _tvSeasonIdRe.Match(resolvedId);
+        var tvMatch       = _tvIdRe.Match(resolvedId);
+        var artistMatch   = _artistIdRe.Match(resolvedId);
+        var albumMatch    = _albumIdRe.Match(resolvedId);
 
         if (movieMatch.Success)
             return await FetchMovieAsync(movieMatch.Groups[1].Value, resolvedId, ct).ConfigureAwait(false);
+
+        // Compound season ID (tv:{tvdbId}/season:{N}) takes precedence over bare show ID
+        if (tvSeasonMatch.Success)
+            return await FetchTvAsync(
+                tvSeasonMatch.Groups[1].Value,
+                resolvedId,
+                int.Parse(tvSeasonMatch.Groups[2].Value),
+                ct).ConfigureAwait(false);
 
         if (tvMatch.Success)
             return await FetchTvAsync(tvMatch.Groups[1].Value, resolvedId, seasonNumber, ct).ConfigureAwait(false);
@@ -541,9 +568,15 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
             (seasonPoster ?? poster)?.Url is not null ? "yes" : "no",
             logo?.Url is not null ? "yes" : "no");
 
+        // Embed season number in ExternalId so re-enrichment and Fix Match can recover season artwork.
+        // IsIdValidForLevel accepts "tv:{N}/season:{N}" (has '/') for child items.
+        var storedExternalId = seasonNumber.HasValue
+            ? $"{externalId}/season:{seasonNumber}"
+            : externalId;
+
         return new MediaMetadata
         {
-            ExternalId      = externalId,
+            ExternalId      = storedExternalId,
             Source          = "fanarttv",
             Title           = response.Name ?? string.Empty,
             PosterUrl       = seasonPoster?.Url ?? poster?.Url,
@@ -575,12 +608,14 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
             logo?.Url is not null ? "yes" : "no",
             response.Albums?.Count ?? 0);
 
+        // Fanart.tv has no portrait-format artist poster — artistthumb is landscape (~500x281).
+        // Map it to ThumbUrl (landscape slot); PosterUrl is left null for artists.
         return new MediaMetadata
         {
             ExternalId  = externalId,
             Source      = "fanarttv",
             Title       = response.Name ?? string.Empty,
-            PosterUrl   = thumb?.Url,
+            ThumbUrl    = thumb?.Url,
             BackdropUrl = backdrop?.Url,
             LogoUrl     = logo?.Url,
             BannerUrl   = banner?.Url,
@@ -660,6 +695,10 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
 
         var seriesMatch = _fanartSeriesUrlRe.Match(input);
         if (seriesMatch.Success) return $"tv:{seriesMatch.Groups[1].Value}";
+
+        // Album URL must be checked before artist URL (it's a more-specific path)
+        var albumMatch = _fanartAlbumUrlRe.Match(input);
+        if (albumMatch.Success) return $"album:{albumMatch.Groups[1].Value}/{albumMatch.Groups[2].Value}";
 
         var musicMatch = _fanartMusicUrlRe.Match(input);
         if (musicMatch.Success) return $"artist:{musicMatch.Groups[1].Value}";
