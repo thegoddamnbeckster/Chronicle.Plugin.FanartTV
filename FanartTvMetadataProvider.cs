@@ -608,14 +608,15 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
             logo?.Url is not null ? "yes" : "no",
             response.Albums?.Count ?? 0);
 
-        // Fanart.tv has no portrait-format artist poster — artistthumb is landscape (~500x281).
-        // Map it to ThumbUrl (landscape slot); PosterUrl is left null for artists.
+        // artistthumb is landscape (~500x281) but it's the only artist photo Fanart.tv provides.
+        // Put it in PosterUrl so it flows through the normal metadata assignment pipeline
+        // and appears in the poster slot on the media detail page (same as TMDB posters for movies/TV).
         return new MediaMetadata
         {
             ExternalId  = externalId,
             Source      = "fanarttv",
             Title       = response.Name ?? string.Empty,
-            ThumbUrl    = thumb?.Url,
+            PosterUrl   = thumb?.Url,
             BackdropUrl = backdrop?.Url,
             LogoUrl     = logo?.Url,
             BannerUrl   = banner?.Url,
