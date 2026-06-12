@@ -390,10 +390,21 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
         {
             // TVDB stores a raw numeric ID. For seasons/episodes, the TVDB ID is on the
             // parent show, not the child — check both the item's own ID and the parent's.
-            if (known.TryGetValue("tvdb", out var tvdbId) && !string.IsNullOrWhiteSpace(tvdbId))
-                return $"tv:{tvdbId}";
-            if (known.TryGetValue("parent_tvdb", out var parentTvdbId) && !string.IsNullOrWhiteSpace(parentTvdbId))
-                return $"tv:{parentTvdbId}";
+            // TVDB IDs may be stored under "tvdb" (raw legacy), "thetvdb" (via
+            // PluginIdHelper.ToSource("chronicle.plugin.thetvdb")), or arrive from the cascade
+            // as "tvdb:344643" or "series:344643". Extract just the numeric part.
+            var rawTvdb = GetFirstValue(known, "tvdb", "thetvdb");
+            if (!string.IsNullOrWhiteSpace(rawTvdb))
+            {
+                var tvdbNum = ExtractNumericId(rawTvdb, "tvdb:", "series:");
+                if (tvdbNum is not null) return $"tv:{tvdbNum}";
+            }
+            var rawParentTvdb = GetFirstValue(known, "parent_tvdb", "parent_thetvdb");
+            if (!string.IsNullOrWhiteSpace(rawParentTvdb))
+            {
+                var parentNum = ExtractNumericId(rawParentTvdb, "tvdb:", "series:");
+                if (parentNum is not null) return $"tv:{parentNum}";
+            }
         }
         else if (mediaType is "music")
         {
@@ -461,6 +472,26 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
         // Plain numeric ID with no prefix
         if (rawId.Length > 0 && rawId.All(char.IsDigit))
             return rawId;
+        return null;
+    }
+
+    // Accepts multiple possible prefixes (e.g. "tvdb:" and "series:") and strips the first match.
+    private static string? ExtractNumericId(string rawId, params string[] prefixes)
+    {
+        foreach (var prefix in prefixes)
+        {
+            var result = ExtractNumericId(rawId, prefix);
+            if (result is not null) return result;
+        }
+        return null;
+    }
+
+    // Returns the first non-empty value found for any of the given keys.
+    private static string? GetFirstValue(IReadOnlyDictionary<string, string> dict, params string[] keys)
+    {
+        foreach (var key in keys)
+            if (dict.TryGetValue(key, out var val) && !string.IsNullOrWhiteSpace(val))
+                return val;
         return null;
     }
 
