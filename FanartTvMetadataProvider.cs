@@ -151,6 +151,12 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
         },
     ];
 
+    // Fanart.tv has no text-search endpoint. It resolves via cross-references:
+    //   TV / anime  → TVDB ID ("tvdb:N" or "tv:N")
+    //   Movies      → TMDB movie ID ("movie:N")
+    public IReadOnlyList<string> GetAcceptedCrossRefPrefixes() =>
+        ["tvdb:", "tv:", "movie:"];
+
     public PluginSettingsSchema GetSettingsSchema() => new()
     {
         Settings =
@@ -287,6 +293,10 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
     {
         EnsureConfigured();
         externalId = NormalizeFanartUrl(externalId);
+
+        // Cross-ref form: "tvdb:344643" → Fanart.tv native form "tv:344643"
+        if (externalId.StartsWith("tvdb:", StringComparison.OrdinalIgnoreCase))
+            externalId = "tv:" + externalId[5..];
 
         // Return cached result from a preceding SearchAsync call for the same ID
         // without making a second HTTP request.
