@@ -121,6 +121,17 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
                 [1] = ["poster_url", "backdrop_url", "banner_url", "thumb_url"],
             },
         },
+        // Standalone anime films — flat like "movies", not hierarchical like "anime" (real anime
+        // TV series). See Chronicle.Plugin.TMDB's anime_movies declaration for the full rationale.
+        new MediaTypeSupport
+        {
+            MediaTypeName   = "anime_movies",
+            DisplayName     = "Anime Movies",
+            HierarchyLevels = 1,
+            DefaultPriority = 20,  // supplements TMDB; lower priority so TMDB wins title/overview
+            SupportedFields = ["poster_url", "backdrop_url", "logo_url", "banner_url",
+                               "disc_url", "clearart_url", "thumb_url"],
+        },
         new MediaTypeSupport
         {
             MediaTypeName    = "anime",
@@ -566,6 +577,25 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
             backdrop?.Url is not null ? "yes" : "no",
             logo?.Url is not null ? "yes" : "no");
 
+        // Lossless ingestion (see Chronicle/CLAUDE.md): BestImage() above picks ONE winner per
+        // type for the first-class fields Kodi actively displays, but Fanart.tv routinely has
+        // many more candidates per type than that -- discarding them was a real data-loss bug,
+        // not a simplification. Every candidate this response actually has, for every type,
+        // is preserved in AdditionalImages (tagged with the same art-type strings
+        // ScraperController.ArtworkFieldMap already uses) so nothing the provider returned is
+        // silently thrown away, and Kodi's own "Choose Art" picker has every real alternate to
+        // offer -- not just the one this plugin happened to rank first.
+        var additionalImages = new List<AdditionalImage>();
+        additionalImages.AddRange(AllImages(response.MoviePosters, "poster"));
+        additionalImages.AddRange(AllImages(response.MovieBackgrounds, "fanart"));
+        additionalImages.AddRange(AllImages(response.HdMovieLogos, "clearlogo"));
+        additionalImages.AddRange(AllImages(response.MovieLogos, "clearlogo"));
+        additionalImages.AddRange(AllImages(response.MovieBanners, "banner"));
+        additionalImages.AddRange(AllImages(response.MovieDiscImages, "discart"));
+        additionalImages.AddRange(AllImages(response.HdMovieClearArts, "clearart"));
+        additionalImages.AddRange(AllImages(response.MovieArts, "clearart"));
+        additionalImages.AddRange(AllImages(response.MovieThumbs, "thumb"));
+
         return new MediaMetadata
         {
             ExternalId  = externalId,
@@ -578,6 +608,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
             DiscUrl     = disc?.Url,
             ClearartUrl = clearart?.Url,
             ThumbUrl    = thumb?.Url,
+            AdditionalImages = additionalImages,
         };
     }
 
@@ -615,6 +646,20 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
             ? $"{externalId}/season:{seasonNumber}"
             : externalId;
 
+        // Lossless ingestion (see Chronicle/CLAUDE.md) -- see FetchMovieAsync's identical comment.
+        var additionalImages = new List<AdditionalImage>();
+        additionalImages.AddRange(AllImages(response.TvPosters, "poster"));
+        additionalImages.AddRange(AllImages(response.ShowBackgrounds, "fanart"));
+        additionalImages.AddRange(AllImages(response.HdTvLogos, "clearlogo"));
+        additionalImages.AddRange(AllImages(response.ClearLogos, "clearlogo"));
+        additionalImages.AddRange(AllImages(response.TvBanners, "banner"));
+        additionalImages.AddRange(AllImages(response.HdClearArts, "clearart"));
+        additionalImages.AddRange(AllImages(response.ClearArts, "clearart"));
+        additionalImages.AddRange(AllImages(response.TvThumbs, "thumb"));
+        additionalImages.AddRange(AllImages(response.CharacterArts, "characterart"));
+        additionalImages.AddRange(AllImages(response.SeasonPosters, "poster"));
+        additionalImages.AddRange(AllImages(response.SeasonThumbs, "thumb"));
+
         return new MediaMetadata
         {
             ExternalId      = storedExternalId,
@@ -627,6 +672,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
             ClearartUrl     = clearart?.Url,
             ThumbUrl        = seasonThumb?.Url ?? thumb?.Url,
             CharacterArtUrl = charArt?.Url,
+            AdditionalImages = additionalImages,
         };
     }
 
@@ -649,6 +695,16 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
             logo?.Url is not null ? "yes" : "no",
             response.Albums?.Count ?? 0);
 
+        // Lossless ingestion (see Chronicle/CLAUDE.md) -- see FetchMovieAsync's identical comment.
+        var additionalImages = new List<AdditionalImage>();
+        additionalImages.AddRange(AllImages(response.ArtistThumbs, "poster"));
+        additionalImages.AddRange(AllImages(response.ArtistBackgrounds, "fanart"));
+        additionalImages.AddRange(AllImages(response.HdMusicLogos, "clearlogo"));
+        additionalImages.AddRange(AllImages(response.MusicLogos, "clearlogo"));
+        additionalImages.AddRange(AllImages(response.MusicBanners, "banner"));
+        additionalImages.AddRange(AllImages(response.HdMusicArts, "clearart"));
+        additionalImages.AddRange(AllImages(response.MusicArts, "clearart"));
+
         // artistthumb is landscape (~500x281) but it's the only artist photo Fanart.tv provides.
         // Put it in PosterUrl so it flows through the normal metadata assignment pipeline
         // and appears in the poster slot on the media detail page (same as TMDB posters for movies/TV).
@@ -662,6 +718,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
             LogoUrl     = logo?.Url,
             BannerUrl   = banner?.Url,
             ClearartUrl = clearart?.Url,
+            AdditionalImages = additionalImages,
         };
     }
 
@@ -688,6 +745,11 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
             cover?.Url is not null ? "yes" : "no",
             cdart?.Url is not null ? "yes" : "no");
 
+        // Lossless ingestion (see Chronicle/CLAUDE.md) -- see FetchMovieAsync's identical comment.
+        var additionalImages = new List<AdditionalImage>();
+        additionalImages.AddRange(AllImages(album?.AlbumCovers, "poster"));
+        additionalImages.AddRange(AllImages(album?.CdArts, "discart"));
+
         // If this specific album has no art on Fanart.tv yet, still return a result so the
         // enrichment row is marked Completed rather than left Pending indefinitely.
         // A scheduled Re-sync All Artwork task will pick up new community-submitted images.
@@ -698,6 +760,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
             Title      = string.Empty,    // title not available from the album art response
             PosterUrl  = cover?.Url,
             DiscUrl    = cdart?.Url,
+            AdditionalImages = additionalImages,
         };
     }
 
@@ -764,6 +827,29 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
             .OrderByDescending(i => LanguageScore(i.Language))
             .ThenByDescending(i => ParseInt(i.Likes))
             .FirstOrDefault(i => !string.IsNullOrWhiteSpace(i.Url));
+    }
+
+    /// <summary>
+    /// Every image in the list with a non-empty URL, converted to AdditionalImage and tagged
+    /// with artType (one of ScraperController.ArtworkFieldMap's strings: "poster", "fanart",
+    /// "clearlogo", "banner", "clearart", "discart", "characterart", or "thumb" for the one
+    /// slot that map doesn't cover). Ranked best-first (same ordering as BestImage) so a
+    /// downstream consumer that only wants the top few still gets them in the right order.
+    /// Deliberately includes the same image BestImage() already picked as the primary field --
+    /// downstream dedup (ScraperController.CollectArtwork's `seen` set) collapses the repeat,
+    /// and excluding it here would require this method to duplicate BestImage()'s own ranking
+    /// logic just to skip one entry.
+    /// </summary>
+    private List<AdditionalImage> AllImages(IReadOnlyList<FanartImage>? images, string artType)
+    {
+        if (images is null or { Count: 0 }) return [];
+
+        return images
+            .Where(i => !string.IsNullOrWhiteSpace(i.Url))
+            .OrderByDescending(i => LanguageScore(i.Language))
+            .ThenByDescending(i => ParseInt(i.Likes))
+            .Select(i => new AdditionalImage { Url = i.Url!, Type = artType })
+            .ToList();
     }
 
     /// <summary>
