@@ -1,7 +1,7 @@
 {
   "plugin_id": "chronicle.plugin.fanarttv",
   "name": "Fanart.tv",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "Chronicle Contributors",
   "description": "Fetches high-quality artwork from Fanart.tv — posters, backgrounds, logos, disc art, clearart, and banners for movies, TV, and music. Requires a free Fanart.tv API key.",
   "min_chronicle_version": "0.1.0",

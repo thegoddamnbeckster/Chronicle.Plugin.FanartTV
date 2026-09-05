@@ -236,6 +236,11 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
     private static readonly Regex _tvIdRe       = new(@"^tv:(\d+)$",                                          RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _tvSeasonIdRe = new(@"^tv:(\d+)/season:(\d+)$",                             RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _artistIdRe   = new(@"^artist:([0-9a-f-]{36})$",                            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    // Album-with-no-release-group fallback (see ResolveExternalId's own comment) -- same
+    // artist mbid as _artistIdRe, but with a per-album name suffix so this album's own
+    // stored id never collides with its parent artist's or its siblings'. Only the mbid is
+    // captured; the name half is decorative and never read back out.
+    private static readonly Regex _artistFallbackAlbumIdRe = new(@"^artist:([0-9a-f-]{36})/noRelease:",       RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex _albumIdRe    = new(@"^album:([0-9a-f-]{36})/([0-9a-f-]{36})$",             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     // Fanart.tv URL patterns for Fix Match normalization
@@ -463,8 +468,20 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
 
                 // If we only have the artist MBID (no release-group), fall back to
                 // artist-level artwork which at least gives the artist backdrop/logo.
+                //
+                // Bug (confirmed live, 2026-08-03): this used to return the bare
+                // "artist:{mbid}" -- byte-identical to the PARENT artist item's own stored
+                // fanarttv external id. Persisting that as this album's own identity made
+                // Chronicle's core enrichment see one external id "owned" by two different
+                // items, which silently merged ~19 Limp Bizkit albums into their own parent
+                // artist item. The artist mbid alone is never enough to keep this id unique
+                // per album (every sibling album missing a release-group id would resolve to
+                // the exact same string), so the album's own name is folded in too --
+                // FetchByResolvedIdAsync's _artistFallbackAlbumIdRe below only needs the mbid
+                // back out to fetch the artist endpoint; the name suffix exists purely to
+                // keep this album's stored id distinct from its parent's and its siblings'.
                 if (artistMbid is not null)
-                    return $"artist:{artistMbid}";
+                    return $"artist:{artistMbid}/noRelease:{Uri.EscapeDataString(context.Name)}";
             }
             // Tracks (level 2+) have no Fanart.tv artwork — skip.
         }
@@ -527,6 +544,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
         var tvSeasonMatch = _tvSeasonIdRe.Match(resolvedId);
         var tvMatch       = _tvIdRe.Match(resolvedId);
         var artistMatch   = _artistIdRe.Match(resolvedId);
+        var artistFallbackAlbumMatch = _artistFallbackAlbumIdRe.Match(resolvedId);
         var albumMatch    = _albumIdRe.Match(resolvedId);
 
         if (movieMatch.Success)
@@ -548,6 +566,13 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
                 albumMatch.Groups[1].Value,   // artistMbid
                 albumMatch.Groups[2].Value,   // releaseGroupMbid
                 resolvedId, ct).ConfigureAwait(false);
+
+        // Checked before the bare artist match: a compound "artist:{mbid}/noRelease:{name}"
+        // string does NOT satisfy _artistIdRe's own end-of-string anchor, so there's no
+        // ordering ambiguity between the two -- this just has to run first since it's the
+        // more specific pattern conceptually (same fetch, different stored-id shape).
+        if (artistFallbackAlbumMatch.Success)
+            return await FetchArtistAsync(artistFallbackAlbumMatch.Groups[1].Value, resolvedId, ct).ConfigureAwait(false);
 
         if (artistMatch.Success)
             return await FetchArtistAsync(artistMatch.Groups[1].Value, resolvedId, ct).ConfigureAwait(false);
