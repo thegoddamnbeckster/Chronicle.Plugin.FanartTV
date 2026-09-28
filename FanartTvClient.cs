@@ -19,6 +19,18 @@ internal sealed class FanartTvClient
 {
     private const string BaseUrl = "https://webservice.fanart.tv/v3.2";
 
+    // Root-caused live (2026-09-28): this class's own doc has always promised "a small jitter
+    // between requests," but nothing in this file ever paced anything -- every call went out
+    // back-to-back. Fanart.tv publishes no numeric limit to aim under, so this is a good-citizen
+    // default rather than a documented target: a base interval with randomized jitter on top, so
+    // requests land at varying, non-mechanical spacing instead of either a tight burst or a
+    // perfectly periodic ping pattern.
+    private static readonly TimeSpan BaseInterval   = TimeSpan.FromMilliseconds(400);
+    private static readonly TimeSpan MaxJitter      = TimeSpan.FromMilliseconds(300);
+    private static readonly SemaphoreSlim _throttle = new(1, 1);
+    private static readonly Random _jitter          = new();
+    private static DateTime _lastRequestUtc         = DateTime.MinValue;
+
     private static readonly JsonSerializerOptions _jsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -90,8 +102,40 @@ internal sealed class FanartTvClient
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// How long to wait before the next request, given how long it's been since the last one.
+    /// Internal (not private) so it's independently testable without faking Task.Delay or the
+    /// wall clock -- see the class-level doc for why this exists (jitter was promised, never
+    /// implemented) and BaseInterval/MaxJitter's own values.
+    /// </summary>
+    internal static TimeSpan ComputeThrottleDelay(TimeSpan elapsedSinceLastRequest, TimeSpan jitter)
+    {
+        var target = BaseInterval + jitter;
+        var wait   = target - elapsedSinceLastRequest;
+        return wait > TimeSpan.Zero ? wait : TimeSpan.Zero;
+    }
+
+    private static async Task ThrottleAsync(CancellationToken ct)
+    {
+        await _throttle.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var jitter  = TimeSpan.FromMilliseconds(_jitter.Next((int)MaxJitter.TotalMilliseconds));
+            var elapsed = DateTime.UtcNow - _lastRequestUtc;
+            var wait    = ComputeThrottleDelay(elapsed, jitter);
+            if (wait > TimeSpan.Zero)
+                await Task.Delay(wait, ct).ConfigureAwait(false);
+            _lastRequestUtc = DateTime.UtcNow;
+        }
+        finally
+        {
+            _throttle.Release();
+        }
+    }
+
     private async Task<T?> GetAsync<T>(string url, CancellationToken ct) where T : class
     {
+        await ThrottleAsync(ct).ConfigureAwait(false);
         var fullUrl = AppendKeys(url);
         _logger.LogDebug("Fanart.tv GET {Url}", url); // log without keys for security
 
