@@ -36,11 +36,14 @@ namespace Chronicle.Plugin.FanartTV;
 /// If none of the required cross-reference IDs are available, SearchAsync returns empty
 /// and the enrichment service marks the row as NotFound for this provider.
 /// </summary>
-public sealed class FanartTvMetadataProvider : IMetadataProvider, IDisposable
+public sealed class FanartTvMetadataProvider : IMetadataProvider, IExternalIdPolicyProvider, IDisposable
 {
     // ── IMetadataProvider identity ────────────────────────────────────────────
 
     public string PluginId => "chronicle.plugin.fanarttv";
+
+    /// <summary>Artist-level ids are shared by many distinct items, so disagreeing on one proves nothing about identity.</summary>
+    public ExternalIdPolicy GetExternalIdPolicy() => new() { Source = "fanarttv", IgnoredForConflicts = true };
     public string Name     => "Fanart.tv";
     public string Version  => "1.0.0";
     public string Author   => "Chronicle Contributors";
