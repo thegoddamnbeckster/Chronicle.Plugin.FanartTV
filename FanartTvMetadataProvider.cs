@@ -43,7 +43,18 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IExternalIdPol
     public string PluginId => "chronicle.plugin.fanarttv";
 
     /// <summary>Artist-level ids are shared by many distinct items, so disagreeing on one proves nothing about identity.</summary>
-    public ExternalIdPolicy GetExternalIdPolicy() => new() { Source = "fanarttv", IgnoredForConflicts = true };
+    public ExternalIdPolicy GetExternalIdPolicy() => new()
+    {
+        Source = "fanarttv",
+        IgnoredForConflicts = true,
+        // A stored id of the wrong kind for its item (a show's "tv:N" left on a movie) is recognised and dropped. Ids of other
+        // shapes (artist, album) are not described here and stay trusted.
+        IdShapes =
+        [
+            new ExternalIdShape { Pattern = @"^tv:\d+(/season:\d+)?$", Depths = [0, 1, 2], ItemFamilies = ["tv"],    EmbedsParentId = false },
+            new ExternalIdShape { Pattern = @"^movie:\d+$",             Depths = [0, 1],     ItemFamilies = ["movie"], EmbedsParentId = false },
+        ],
+    };
     public string Name     => "Fanart.tv";
     public string Version  => "1.0.0";
     public string Author   => "Chronicle Contributors";
@@ -170,6 +181,16 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IExternalIdPol
     //   Movies      → TMDB movie ID ("movie:N")
     public IReadOnlyList<string> GetAcceptedCrossRefPrefixes() =>
         ["tvdb:", "movie:"];
+
+    // An item is only ever looked up as its own kind: a movie gets Fanart.tv's movie results, a show its tv ones. Which of the ids
+    // above can seed a lookup therefore depends on the item (a show's TVDB id must never be used for a movie).
+    public IReadOnlyList<string> GetAcceptedCrossRefPrefixes(string? providerFamily) => providerFamily?.ToLowerInvariant() switch
+    {
+        "movie" => ["movie:"],
+        "tv"    => ["tvdb:"],
+        null    => GetAcceptedCrossRefPrefixes(),
+        _       => [],                       // music and the rest are never looked up through a movie or show id
+    };
 
     public PluginSettingsSchema GetSettingsSchema() => new()
     {
