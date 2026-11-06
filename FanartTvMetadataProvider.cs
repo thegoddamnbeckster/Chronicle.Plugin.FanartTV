@@ -56,7 +56,7 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IExternalIdPol
         ],
     };
     public string Name     => "Fanart.tv";
-    public string Version  => "1.0.0";
+    public string Version  => System.Reflection.CustomAttributeExtensions.GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(typeof(FanartTvMetadataProvider).Assembly)?.InformationalVersion.Split('+')[0] ?? "1.1.3";
     public string Author   => "Chronicle Contributors";
 
     // ── Settings keys ─────────────────────────────────────────────────────────
