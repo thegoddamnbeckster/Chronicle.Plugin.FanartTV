@@ -244,7 +244,8 @@ public sealed class FanartTvMetadataProvider : IMetadataProvider, IExternalIdPol
 
         var http = new HttpClient
         {
-            DefaultRequestHeaders = { { "User-Agent", "Chronicle/1.0" } }
+            Timeout = TimeSpan.FromSeconds(20),
+            DefaultRequestHeaders = { { "User-Agent", $"Chronicle-FanartTV/{Version}" } }
         };
         _ownedHttpClient   = http;
         _client            = new FanartTvClient(http, apiKey, clientKey, _logger);
