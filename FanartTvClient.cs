@@ -161,10 +161,11 @@ internal sealed class FanartTvClient
             var retryAfter = response.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(10);
             _logger.LogWarning("Fanart.tv rate limit hit (429) for {Url}. Retry-After: {Delay}s",
                 url, retryAfter.TotalSeconds);
-            // Respect Retry-After, then propagate as transient failure so the
-            // enrichment service marks the row as Failed and retries at next scheduled task.
+            // Respect Retry-After, then report a rate limit (not a failure of this item) and say how long
+            // the provider asked for, so Chronicle's queue waits that long and carries on with the rest.
             await Task.Delay(retryAfter, ct).ConfigureAwait(false);
-            throw new HttpRequestException("Fanart.tv rate limit hit (429). Retry later.");
+            throw new HttpRequestException("Fanart.tv rate limit hit (429). Retry later.", null, HttpStatusCode.TooManyRequests)
+            { Data = { ["RetryAfter"] = retryAfter } };
         }
 
         if (!response.IsSuccessStatusCode)
